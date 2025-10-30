@@ -1,0 +1,23 @@
+campaign_id: fall-espresso-2025
+brand:
+  name: "Moss & Ember Coffee"
+  colors: ["#151515", "#A86238", "#FFFFFF"]
+  logo_path: "assets/brand/logo.png"
+products:
+  - id: espresso-pods
+    name: "Espresso Pods"
+    hero_asset: "assets/products/espresso.png"
+  #- id: pour-over-kit
+  #  name: "Pour-over Kit"
+  #  hero_asset: null
+target:
+  region: "DE"          # will translate if ENABLE_TRANSLATION=1 and message.de missing
+  audience: "Young professionals"
+message:
+  en: "Fuel your focus guaranteed"
+  # de: "Fokus im Becher."   # left out to demonstrate optional translation
+variants:
+  aspect_ratios: ["1:1", "9:16", "16:9"]
+  count_per_product: 2
+legal:
+  prohibited_terms: ["100% free", "guaranteed"]

@@ -1,0 +1,59 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+*.env.bak
+
+# --- Environment & secrets ---
+.env
+.env.local
+.env.*
+!example.env
+!*.env.example
+
+# --- Output folders ---
+outputs/
+outputs/*
+!outputs/.keep
+
+# --- Logs and reports ---
+*.log
+*.csv
+*.json
+!config/compliance_rules.json  # keep rule definitions
+!briefs/*.yaml                 # keep example briefs
+
+# --- Generated assets ---
+assets/products/*.png
+assets/products/*.jpg
+assets/logos/*.png
+assets/fonts/*.ttf
+!assets/fonts/Inter_24pt-Regular.ttf  # keep font if redistributable
+outputs/**
+
+# --- IDE & OS junk ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --- Build or packaging ---
+build/
+dist/
+*.egg-info/
+*.spec
+
+# --- Temporary files ---
+*.tmp
+*.bak
+*.old
+*~
