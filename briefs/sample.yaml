@@ -7,9 +7,9 @@ products:
   - id: espresso-pods
     name: "Espresso Pods"
     hero_asset: "assets/products/espresso.png"
-  #- id: pour-over-kit
-  #  name: "Pour-over Kit"
-  #  hero_asset: null
+  - id: pour-over-kit
+    name: "Pour-over Kit"
+    hero_asset: null
 target:
   region: "DE"          # will translate if ENABLE_TRANSLATION=1 and message.de missing
   audience: "Young professionals"
