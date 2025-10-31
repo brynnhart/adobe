@@ -11,12 +11,14 @@ from .layout.templater import to_ratio, apply_template
 from .checks.compliance import has_logo, uses_brand_color
 from .util.logger import info, warn
 from .compliance.rules import ComplianceRules, check_message
+from .providers.openai_text import OpenAIText  # <-- ADD: translator
 
-
-def translate_if_needed(brief: Brief, lang: str) -> str:
-    msg = brief.message.get_for_lang(lang)
-    return msg if msg else brief.message.get_default()
-
+# --------- ENV HELPERS ---------
+def _bool_env(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
 
 def _asset_valid(path: str | None, min_px: int = 256) -> bool:
     """Consider an asset reusable only if it exists, decodes, and is reasonably sized."""
@@ -32,14 +34,89 @@ def _asset_valid(path: str | None, min_px: int = 256) -> bool:
     except Exception:
         return False
 
+# --------- LANGUAGE RESOLUTION + TRANSLATION ---------
+_REGION_TO_LANG = {
+    "us": "en", "uk": "en", "gb": "en", "ca": "en",
+    "de": "de", "at": "de", "ch": "de",
+    "fr": "fr", "be": "fr",
+    "es": "es", "mx": "es", "ar": "es", "co": "es",
+    "it": "it", "pt": "pt", "br": "pt",
+    "nl": "nl", "se": "sv", "no": "no", "dk": "da",
+    "fi": "fi", "pl": "pl", "cz": "cs",
+    "jp": "ja", "kr": "ko", "cn": "zh", "tw": "zh-TW",
+}
 
-def _bool_env(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.lower() in ("1", "true", "yes", "on")
+def _derive_target_lang(brief: Brief) -> str:
+    # 1) Explicit override from env
+    env_lang = os.getenv("TARGET_LANG")
+    if env_lang:
+        return env_lang.strip()
 
+    # 2) If your Brief has a language field on target, prefer it
+    # (won't break if not present)
+    target_lang = getattr(brief.target, "language", None)
+    if target_lang:
+        return str(target_lang).strip()
 
+    # 3) Fallback: map region -> language
+    region = str(getattr(brief.target, "region", "")).lower()
+    return _REGION_TO_LANG.get(region, "en")
+
+def _resolve_message_with_translation(brief: Brief) -> Tuple[str, str, bool]:
+    """
+    Returns (headline_text, target_lang, translated_flag)
+    - If the brief already contains localized copy for the target lang, uses it.
+    - Otherwise, if ENABLE_TRANSLATION=1, translates default copy to target lang.
+    - Else, falls back to default copy (likely English).
+    """
+    enable_tx = _bool_env("ENABLE_TRANSLATION", default=False)
+    target_lang = _derive_target_lang(brief)
+
+    # If the brief already contains the target language, use it
+    try:
+        # assuming message has get_for_lang(lang_code) method (already used in your code)
+        existing = brief.message.get_for_lang(target_lang)
+    except Exception:
+        existing = None
+
+    if existing:
+        info(f"    [i18n] Using existing localized headline for '{target_lang}'.")
+        return existing, target_lang, False
+
+    # Fallback to default (e.g., English)
+    try:
+        default_msg = brief.message.get_default()
+    except Exception:
+        default_msg = ""
+
+    if not default_msg:
+        warn("    [i18n] No default message found in brief; headline will be empty.")
+        return "", target_lang, False
+
+    # If target is effectively English, no need to translate
+    if target_lang.lower().startswith("en"):
+        info("    [i18n] Target language is English; using default headline without translation.")
+        return default_msg, target_lang, False
+
+    # Attempt translation if enabled
+    if enable_tx:
+        translator = OpenAIText()
+        try:
+            out = translator.translate(default_msg, target_lang)
+            if out:
+                info(f"    [i18n] Translated headline to '{target_lang}'.")
+                return out, target_lang, True
+            else:
+                warn(f"    [i18n] Translation returned empty for '{target_lang}'. Using default headline.")
+                return default_msg, target_lang, False
+        except Exception as e:
+            warn(f"    [i18n] Translation error for '{target_lang}': {e!r}. Using default headline.")
+            return default_msg, target_lang, False
+    else:
+        info("    [i18n] ENABLE_TRANSLATION is off; using default headline without translation.")
+        return default_msg, target_lang, False
+
+# --------- COMPLIANCE WRAPPER ---------
 def _run_check_message(text: str, rules: ComplianceRules) -> Tuple[str, list[str], bool, Dict[str, str]]:
     """
     Wrapper that tolerates either 3-tuple or 4-tuple returns from check_message():
@@ -48,7 +125,6 @@ def _run_check_message(text: str, rules: ComplianceRules) -> Tuple[str, list[str
     Returns a normalized 4-tuple: (cleaned, remaining, modified, replacements).
     """
     res = check_message(text, rules)
-    # If rules.check_message returns a tuple of 3 or 4 elements, normalize
     if isinstance(res, tuple):
         if len(res) == 4:
             cleaned, remaining, modified, replacements = res
@@ -56,17 +132,14 @@ def _run_check_message(text: str, rules: ComplianceRules) -> Tuple[str, list[str
             cleaned, remaining, modified = res
             replacements = {}
         else:
-            # Unexpected shape; fall back safely
             cleaned, remaining, modified, replacements = text, [], False, {}
     else:
-        # Unexpected return type; fall back to original text
         cleaned, remaining, modified, replacements = text, [], False, {}
-    # Ensure types
     remaining = list(remaining) if remaining else []
     replacements = dict(replacements) if replacements else {}
     return cleaned, remaining, bool(modified), replacements
 
-
+# --------- MAIN PIPELINE ---------
 def process_campaign(brief: Brief, out_dir: str, variants_override: int | None = None):
     """
     Main pipeline orchestration:
@@ -141,15 +214,11 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                         base = provider.generate(prompt, (1536, 1536))
                         dt = (time.time() - t0) * 1000
                         info(f"    [{ratio}] OpenAI generation returned in {dt:.0f} ms, size={getattr(base, 'size', None)}")
-                        # Optional: persist the raw generation before any crop/overlay (disabled by default)
-                        # raw_path = ratio_dir / f"_raw_gen_{idx + 1}.png"
-                        # base.save(raw_path, "PNG")
                         source = "generated"
                     except Exception as e:
                         warn(f"    OpenAI generation failed ({e!r}); using neutral placeholder.")
                         base = Image.new("RGB", (1536, 1536), (54, 54, 60))
-                        # Save a proper PNG so it's viewable
-                        (ratio_dir / f"_raw_fallback_{idx + 1}.png").write_bytes(b"")  # create marker
+                        (ratio_dir / f"_raw_fallback_{idx + 1}.png").write_bytes(b"")  # marker
                         base.save(ratio_dir / f"_raw_fallback_{idx + 1}.png", "PNG")
                         source = "fallback"
 
@@ -158,18 +227,21 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                     raise RuntimeError("Provider did not return a valid image. Check API key/org/model settings.")
                 base = to_ratio(base, ratio)
 
-                # --- 3) Compliance check on message (demo-friendly logging) ---
-                lang = brief.target.region.lower()
-                headline_raw = translate_if_needed(brief, lang)
+                # --- 3) Resolve message (with translation if needed) ---
+                headline_raw, tgt_lang, was_translated = _resolve_message_with_translation(brief)
+                if was_translated:
+                    info(f"    [i18n] Headline translated to '{tgt_lang}'.")
+                else:
+                    info(f"    [i18n] Headline used without translation (lang='{tgt_lang}').")
 
+                # --- 4) Compliance check on message (demo-friendly logging) ---
                 cleaned, remaining, modified, replacements = _run_check_message(headline_raw, rules)
                 headline = cleaned
 
-                # Verbose messages for demo
                 if remaining and not modified:
                     product_violations += 1
                     total_with_violations += 1
-                    warn(f"    ⚠️ Compliance: {remaining} found in headline(no replacements applied)")
+                    warn(f"    ⚠️ Compliance: {remaining} found in headline (no replacements applied)")
                 elif modified and replacements:
                     product_sanitized += 1
                     total_sanitized += 1
@@ -181,7 +253,7 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                     total_sanitized += 1
                     info(f"    ✅ Compliance: sanitized headline")
 
-                # --- 4) Apply brand overlay ---
+                # --- 5) Apply brand overlay ---
                 result = apply_template(
                     base,
                     headline=headline,
@@ -189,11 +261,11 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                     logo_path=brief.brand.logo_path,
                 )
 
-                # --- 5) Save output ---
+                # --- 6) Save output ---
                 out_path = ratio_dir / f"post_{idx + 1}.png"
                 result.save(out_path, "PNG")
 
-                # --- 6) QC checks + report row ---
+                # --- 7) QC checks + report row ---
                 logo_ok = has_logo(brief.brand.logo_path)
                 brand_color_ok = uses_brand_color(brief.brand.colors)
 
@@ -208,6 +280,8 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                     "brand_color_applied": brand_color_ok,
                     "prohibited_terms_found": ";".join(remaining),
                     "compliance_modified_copy": "yes" if modified else "no",
+                    "target_lang": tgt_lang,
+                    "translated": "yes" if was_translated else "no",
                 })
 
         # Per-product compliance summary (nice for demos)
@@ -215,7 +289,7 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
             info(f"  └─ Compliance summary for {product.name}: "
                  f"{product_sanitized} sanitized, {product_violations} with warnings")
 
-    # --- 7) Save run report ---
+    # --- 8) Save run report ---
     run_root = Path(out_dir) / brief.campaign_id
     ensure_dir(run_root)
     save_json(run_root / "run_report.json", report_rows)
