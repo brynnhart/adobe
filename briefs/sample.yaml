@@ -19,5 +19,4 @@ message:
 variants:
   aspect_ratios: ["1:1", "9:16", "16:9"]
   count_per_product: 2
-legal:
-  prohibited_terms: ["100% free", "guaranteed"]
+
