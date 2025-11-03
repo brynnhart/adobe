@@ -96,6 +96,8 @@ cp .env.example .env  # then edit with your keys
 | `COMPLIANCE_RULES_PATH` | Path to compliance JSON file. |
 | `COMPLIANCE_SANITIZE` | `1` replaces unsafe terms with approved alternatives. |
 | `FORCE_GENERATE` | `1` forces regeneration even if assets exist. |
+| `HEADLINE_SCALE` | `1` Overall scale of text. |
+| `HEADLINE_MAX_LINES` | `1` Maximum number of lines text is allowed to wrap. |
 
 > You can export these directly in your shell instead of using `.env`.
 

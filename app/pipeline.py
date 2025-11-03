@@ -11,14 +11,24 @@ from .layout.templater import to_ratio, apply_template
 from .checks.compliance import has_logo, uses_brand_color
 from .util.logger import info, warn
 from .compliance.rules import ComplianceRules, check_message
-from .providers.openai_text import OpenAIText  # <-- ADD: translator
 
-# --------- ENV HELPERS ---------
+# --- Try both possible locations for your translator ---
+try:
+    from .providers.openai_text import OpenAIText  # preferred (app/providers/openai_text.py)
+except Exception:
+    try:
+        from .openai_text import OpenAIText        # fallback (app/openai_text.py)
+    except Exception:
+        OpenAIText = None  # handled later
+
+
+# ----------------- helpers -----------------
 def _bool_env(name: str, default: bool = False) -> bool:
     val = os.getenv(name)
     if val is None:
         return default
     return val.lower() in ("1", "true", "yes", "on")
+
 
 def _asset_valid(path: str | None, min_px: int = 256) -> bool:
     """Consider an asset reusable only if it exists, decodes, and is reasonably sized."""
@@ -34,7 +44,7 @@ def _asset_valid(path: str | None, min_px: int = 256) -> bool:
     except Exception:
         return False
 
-# --------- LANGUAGE RESOLUTION + TRANSLATION ---------
+
 _REGION_TO_LANG = {
     "us": "en", "uk": "en", "gb": "en", "ca": "en",
     "de": "de", "at": "de", "ch": "de",
@@ -46,83 +56,45 @@ _REGION_TO_LANG = {
     "jp": "ja", "kr": "ko", "cn": "zh", "tw": "zh-TW",
 }
 
+
 def _derive_target_lang(brief: Brief) -> str:
-    # 1) Explicit override from env
+    """Env override > brief.target.language > brief.target.region -> language > 'en'."""
     env_lang = os.getenv("TARGET_LANG")
     if env_lang:
         return env_lang.strip()
 
-    # 2) If your Brief has a language field on target, prefer it
-    # (won't break if not present)
     target_lang = getattr(brief.target, "language", None)
     if target_lang:
         return str(target_lang).strip()
 
-    # 3) Fallback: map region -> language
     region = str(getattr(brief.target, "region", "")).lower()
     return _REGION_TO_LANG.get(region, "en")
 
-def _resolve_message_with_translation(brief: Brief) -> Tuple[str, str, bool]:
-    """
-    Returns (headline_text, target_lang, translated_flag)
-    - If the brief already contains localized copy for the target lang, uses it.
-    - Otherwise, if ENABLE_TRANSLATION=1, translates default copy to target lang.
-    - Else, falls back to default copy (likely English).
-    """
-    enable_tx = _bool_env("ENABLE_TRANSLATION", default=False)
-    target_lang = _derive_target_lang(brief)
 
-    # If the brief already contains the target language, use it
+def _get_existing_local(brief: Brief, lang: str) -> str | None:
+    """Return localized message from brief if present, else None."""
     try:
-        # assuming message has get_for_lang(lang_code) method (already used in your code)
-        existing = brief.message.get_for_lang(target_lang)
+        msg = brief.message.get_for_lang(lang)
+        return msg if msg else None
     except Exception:
-        existing = None
+        return None
 
-    if existing:
-        info(f"    [i18n] Using existing localized headline for '{target_lang}'.")
-        return existing, target_lang, False
 
-    # Fallback to default (e.g., English)
+def _get_default_msg(brief: Brief) -> str:
     try:
-        default_msg = brief.message.get_default()
+        return brief.message.get_default() or ""
     except Exception:
-        default_msg = ""
+        return ""
 
-    if not default_msg:
-        warn("    [i18n] No default message found in brief; headline will be empty.")
-        return "", target_lang, False
 
-    # If target is effectively English, no need to translate
-    if target_lang.lower().startswith("en"):
-        info("    [i18n] Target language is English; using default headline without translation.")
-        return default_msg, target_lang, False
-
-    # Attempt translation if enabled
-    if enable_tx:
-        translator = OpenAIText()
-        try:
-            out = translator.translate(default_msg, target_lang)
-            if out:
-                info(f"    [i18n] Translated headline to '{target_lang}'.")
-                return out, target_lang, True
-            else:
-                warn(f"    [i18n] Translation returned empty for '{target_lang}'. Using default headline.")
-                return default_msg, target_lang, False
-        except Exception as e:
-            warn(f"    [i18n] Translation error for '{target_lang}': {e!r}. Using default headline.")
-            return default_msg, target_lang, False
-    else:
-        info("    [i18n] ENABLE_TRANSLATION is off; using default headline without translation.")
-        return default_msg, target_lang, False
-
-# --------- COMPLIANCE WRAPPER ---------
-def _run_check_message(text: str, rules: ComplianceRules) -> Tuple[str, list[str], bool, Dict[str, str]]:
+def _check_message4(text: str, rules: ComplianceRules) -> Tuple[str, list[str], bool, Dict[str, str]]:
     """
-    Wrapper that tolerates either 3-tuple or 4-tuple returns from check_message():
-      - (cleaned, remaining, modified)
-      - (cleaned, remaining, modified, replacements)
-    Returns a normalized 4-tuple: (cleaned, remaining, modified, replacements).
+    Normalize check_message() to always return 4 values:
+      (cleaned, remaining, modified, replacements)
+
+    Works with implementations that return:
+      - 4-tuple: (cleaned, remaining, modified, replacements)
+      - 3-tuple: (cleaned, remaining, modified)
     """
     res = check_message(text, rules)
     if isinstance(res, tuple):
@@ -135,18 +107,116 @@ def _run_check_message(text: str, rules: ComplianceRules) -> Tuple[str, list[str
             cleaned, remaining, modified, replacements = text, [], False, {}
     else:
         cleaned, remaining, modified, replacements = text, [], False, {}
-    remaining = list(remaining) if remaining else []
-    replacements = dict(replacements) if replacements else {}
-    return cleaned, remaining, bool(modified), replacements
+    return cleaned, list(remaining) if remaining else [], bool(modified), dict(replacements)
 
-# --------- MAIN PIPELINE ---------
+
+def _compute_final_headline_once(
+    brief: Brief,
+    rules: ComplianceRules,
+    enable_translation: bool,
+    tgt_lang: str
+) -> Tuple[str, bool, Dict[str, Any]]:
+    """
+    Compute the campaign headline exactly once:
+      1) Use existing localized headline if available for tgt_lang.
+      2) Else take default (assume English), run pre-translation compliance (single-language rules).
+      3) Translate the sanitized text ONCE if enabled and tgt_lang != en.
+
+    Returns: (final_headline, was_translated, meta)
+      meta includes counts for sanitized/warnings and any replacement map for logging/report.
+    """
+    # 1) Use existing localized copy if present
+    existing_local = _get_existing_local(brief, tgt_lang)
+    if existing_local:
+        info(f"[i18n] Using existing localized headline for '{tgt_lang}'. (No translation needed)")
+        return existing_local, False, {
+            "source": "localized",
+            "sanitized": 0,
+            "violations": 0,
+            "replacements": {}
+        }
+
+    # 2) Start from default (assume English)
+    source_text = _get_default_msg(brief)
+    if not source_text:
+        warn("[i18n] No default message found in brief; headline will be empty.")
+        return "", False, {
+            "source": "empty",
+            "sanitized": 0,
+            "violations": 0,
+            "replacements": {}
+        }
+
+    # Pre-translation compliance (English-only rules)
+    cleaned_src, remaining_src, modified_src, repl_src = _check_message4(source_text, rules)
+    if remaining_src and not modified_src:
+        warn(f"⚠️ Compliance (pre-translation): {remaining_src} (no replacements applied)")
+    elif modified_src and repl_src:
+        info("✅ Compliance (pre-translation): replaced prohibited terms")
+        for bad, good in repl_src.items():
+            info(f'   → "{bad}" → "{good}"')
+    elif modified_src:
+        info("✅ Compliance (pre-translation): sanitized headline")
+
+    headline_pre = cleaned_src
+    sanitized_cnt = 1 if modified_src else 0
+    violations_cnt = 1 if (remaining_src and not modified_src) else 0
+
+    # 3) Single translation call (if enabled and not English target)
+    if enable_translation and not tgt_lang.lower().startswith("en"):
+        if OpenAIText is None:
+            warn("[i18n] Translation requested but OpenAIText is unavailable. Using sanitized English.")
+            return headline_pre, False, {
+                "source": "sanitized_en",
+                "sanitized": sanitized_cnt,
+                "violations": violations_cnt,
+                "replacements": repl_src
+            }
+        try:
+            translator = OpenAIText()
+            translated = translator.translate(headline_pre, tgt_lang)
+            if translated:
+                info(f"[i18n] Translated sanitized headline to '{tgt_lang}' (cached for all creatives).")
+                return translated, True, {
+                    "source": "translated",
+                    "sanitized": sanitized_cnt,
+                    "violations": violations_cnt,
+                    "replacements": repl_src
+                }
+            else:
+                warn(f"[i18n] Translation returned empty for '{tgt_lang}'. Using sanitized English.")
+                return headline_pre, False, {
+                    "source": "sanitized_en",
+                    "sanitized": sanitized_cnt,
+                    "violations": violations_cnt,
+                    "replacements": repl_src
+                }
+        except Exception as e:
+            warn(f"[i18n] Translation error for '{tgt_lang}': {e!r}. Using sanitized English.")
+            return headline_pre, False, {
+                "source": "sanitized_en",
+                "sanitized": sanitized_cnt,
+                "violations": violations_cnt,
+                "replacements": repl_src
+            }
+    else:
+        info(f"[i18n] Translation skipped (lang='{tgt_lang}'). Using sanitized English.")
+        return headline_pre, False, {
+            "source": "sanitized_en",
+            "sanitized": sanitized_cnt,
+            "violations": violations_cnt,
+            "replacements": repl_src
+        }
+
+
+# ----------------- main pipeline -----------------
 def process_campaign(brief: Brief, out_dir: str, variants_override: int | None = None):
     """
-    Main pipeline orchestration:
-      1) Generate or reuse hero assets (with validation and FORCE_GENERATE override)
-      2) Crop to required ratios
-      3) Apply brand overlays
-      4) Compliance checks (with demo-friendly logs)
+    Main pipeline orchestration (headline computed once per campaign):
+      1) Compute final headline ONCE (localized OR sanitized English OR translated sanitized)
+      2) Generate or reuse hero assets
+      3) Crop to required ratios
+      4) Apply brand overlays with the cached headline
       5) Save outputs + reports
     """
     info(f"Processing campaign {brief.campaign_id}")
@@ -165,20 +235,33 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
     info(f"Loaded {len(rules.prohibited_terms)} prohibited terms for compliance checking.")
 
     force_generate = _bool_env("FORCE_GENERATE", default=False)
+    enable_translation = _bool_env("ENABLE_TRANSLATION", default=False)
     info(f"FORCE_GENERATE={'on' if force_generate else 'off'}")
+    info(f"ENABLE_TRANSLATION={'on' if enable_translation else 'off'}")
 
-    # Track compliance summary for a nicer demo close-out
+    tgt_lang = _derive_target_lang(brief)
+
+    # ---- Compute the headline ONCE and cache it ----
+    final_headline, headline_was_translated, headline_meta = _compute_final_headline_once(
+        brief=brief,
+        rules=rules,
+        enable_translation=enable_translation,
+        tgt_lang=tgt_lang
+    )
+
+    # Nice summary log for the run
+    info(f"[i18n] Headline source: {headline_meta.get('source')}; "
+         f"translated={'yes' if headline_was_translated else 'no'}; "
+         f"pre-sanitized={'yes' if headline_meta.get('sanitized') else 'no'}; "
+         f"pre-violations={'yes' if headline_meta.get('violations') else 'no'}")
+
+    # Track totals just for a clean final log
     total_creatives = 0
-    total_sanitized = 0
-    total_with_violations = 0
 
     for product in brief.products:
         info(f"  Product: {product.name}")
         product_dir = Path(out_dir) / brief.campaign_id / product.id
         ensure_dir(product_dir)
-
-        product_sanitized = 0
-        product_violations = 0
 
         for ratio in ratios:
             ratio_dir = product_dir / ratio.replace(":", "x")
@@ -227,45 +310,19 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                     raise RuntimeError("Provider did not return a valid image. Check API key/org/model settings.")
                 base = to_ratio(base, ratio)
 
-                # --- 3) Resolve message (with translation if needed) ---
-                headline_raw, tgt_lang, was_translated = _resolve_message_with_translation(brief)
-                if was_translated:
-                    info(f"    [i18n] Headline translated to '{tgt_lang}'.")
-                else:
-                    info(f"    [i18n] Headline used without translation (lang='{tgt_lang}').")
-
-                # --- 4) Compliance check on message (demo-friendly logging) ---
-                cleaned, remaining, modified, replacements = _run_check_message(headline_raw, rules)
-                headline = cleaned
-
-                if remaining and not modified:
-                    product_violations += 1
-                    total_with_violations += 1
-                    warn(f"    ⚠️ Compliance: {remaining} found in headline (no replacements applied)")
-                elif modified and replacements:
-                    product_sanitized += 1
-                    total_sanitized += 1
-                    info(f"    ✅ Compliance: replaced prohibited terms in headline")
-                    for bad, good in replacements.items():
-                        info(f"       → \"{bad}\" → \"{good}\"")
-                elif modified:
-                    product_sanitized += 1
-                    total_sanitized += 1
-                    info(f"    ✅ Compliance: sanitized headline")
-
-                # --- 5) Apply brand overlay ---
+                # --- 3) Apply brand overlay with cached headline ---
                 result = apply_template(
                     base,
-                    headline=headline,
+                    headline=final_headline,
                     brand_colors=brief.brand.colors,
                     logo_path=brief.brand.logo_path,
                 )
 
-                # --- 6) Save output ---
+                # --- 4) Save output ---
                 out_path = ratio_dir / f"post_{idx + 1}.png"
                 result.save(out_path, "PNG")
 
-                # --- 7) QC checks + report row ---
+                # --- 5) QC checks + report row ---
                 logo_ok = has_logo(brief.brand.logo_path)
                 brand_color_ok = uses_brand_color(brief.brand.colors)
 
@@ -278,23 +335,14 @@ def process_campaign(brief: Brief, out_dir: str, variants_override: int | None =
                     "source": source,
                     "logo_present": logo_ok,
                     "brand_color_applied": brand_color_ok,
-                    "prohibited_terms_found": ";".join(remaining),
-                    "compliance_modified_copy": "yes" if modified else "no",
                     "target_lang": tgt_lang,
-                    "translated": "yes" if was_translated else "no",
+                    "translated": "yes" if headline_was_translated else "no",
                 })
 
-        # Per-product compliance summary (nice for demos)
-        if product_sanitized or product_violations:
-            info(f"  └─ Compliance summary for {product.name}: "
-                 f"{product_sanitized} sanitized, {product_violations} with warnings")
-
-    # --- 8) Save run report ---
+    # --- Save run report ---
     run_root = Path(out_dir) / brief.campaign_id
     ensure_dir(run_root)
     save_json(run_root / "run_report.json", report_rows)
     save_csv(run_root / "run_report.csv", report_rows)
 
-    # Final one-line compliance summary (demo polish)
-    info(f"Run complete: {len(report_rows)} creatives saved to {run_root} "
-         f"(compliance: {total_sanitized} sanitized, {total_with_violations} with warnings)")
+    info(f"Run complete: {len(report_rows)} creatives saved to {run_root}")

@@ -21,7 +21,6 @@ def get_font(size: int = 48) -> ImageFont.FreeTypeFont:
     for p in candidates:
         try:
             if p.exists():
-                # print(f"[INFO] Using font: {p}")
                 return ImageFont.truetype(str(p), size=int(size))
         except Exception as e:
             print(f"[WARN] Tried {p} but failed: {e}")
@@ -82,13 +81,12 @@ def _hard_break_token(draw: ImageDraw.ImageDraw, token: str, font: ImageFont.Fre
                       max_width: int, stroke_w: int) -> List[str]:
     """
     Breaks a single overlong token into hyphenated chunks that each fit max_width.
-    Example: "supercalifragilisticexpialidocious" -> ["supercali-", "fragilist-", "icexpiali-", "docious"]
     """
     chunks: List[str] = []
     cur = ""
     for ch in token:
         test = (cur + ch)
-        wpx, _ = _measure_line(draw, test + "-", font, stroke_w)  # measure with a hyphen
+        wpx, _ = _measure_line(draw, test + "-", font, stroke_w)
         if wpx <= max_width:
             cur = test
         else:
@@ -96,7 +94,6 @@ def _hard_break_token(draw: ImageDraw.ImageDraw, token: str, font: ImageFont.Fre
                 chunks.append(cur + "-")
                 cur = ch
             else:
-                # single char doesn't even fit; force append to avoid infinite loop
                 chunks.append(ch)
                 cur = ""
     if cur:
@@ -120,7 +117,6 @@ def _wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
     cur = ""
 
     for token in words:
-        # If token alone is too wide, hyphenate it
         token_width, _ = _measure_line(draw, token, font, stroke_w)
         if token_width > max_width:
             hyph = _hard_break_token(draw, token, font, max_width, stroke_w)
@@ -138,7 +134,6 @@ def _wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTyp
                 break
             continue
 
-        # Normal token flow
         test = (cur + " " + token).strip()
         wpx, _ = _measure_line(draw, test, font, stroke_w)
         if wpx <= max_width or not cur:
@@ -167,26 +162,63 @@ def _fit_text_block(draw: ImageDraw.ImageDraw, text: str, font_loader,
     """
     Choose a font size (via binary search) and wrapping that fits in (max_w, max_h).
     Returns (font, wrapped_lines, line_height_px).
-    If it cannot fit using the preferred line count, it will escalate to more lines (up to 3).
+    Strategy:
+      • Prefer 1 line on wide, 2 on square, 3 on tall; escalate if needed.
+      • Cap font size by per-line height and width budgets.
+      • Apply global HEADLINE_SCALE to tame aggressive sizes.
     """
+    if not text:
+        f = font_loader(20)
+        return f, [], int(_measure_line(draw, "Ag", f, 0)[1] * 1.1)
+
+    # Allow tuning from env
+    global_scale = float(os.getenv("HEADLINE_SCALE", "1"))
+    forced_lines = os.getenv("HEADLINE_MAX_LINES", "1")  # "1" | "2" | "3" or None
+    forced_lines = int(forced_lines) if (forced_lines and forced_lines.isdigit()) else None
+
     # Preferred max lines by ratio
     preferred = 1 if ar >= 1.4 else (3 if ar < 0.9 else 2)
-    for allowed_lines in range(preferred, 4):  # try preferred, then escalate to 3
-        lo, hi = 18, max(26, int(max_h * (0.95 if ar <= 0.8 else 0.80)))  # upper bound guess
+    line_candidates = [preferred, 2, 3, 1]  # try preferred first, then others
+    if forced_lines in (1, 2, 3):
+        line_candidates = [forced_lines]
+
+    # Hard caps to avoid oversized look
+    WIDTH_FIT = 0.94  # each line must be <= 94% of max_w
+    HEIGHT_FIT = 0.94  # total text block height must be <= 94% of max_h
+    # Stroke is thinner so big sizes don’t bloat
+    def _stroke_for(font_size: int) -> int:
+        return max(1, int(font_size * 0.05))
+
+    for allowed_lines in line_candidates:
+        # Height budget per line; keep it conservative
+        per_line_h_cap = (max_h / max(1, allowed_lines)) * 0.58  # 58% of per-line height box
+        # Width-derived rough cap (so huge short words don’t explode)
+        width_based_cap = max_w * 0.11                           # no taller than ~11% of box width
+        hi_cap = int(min(per_line_h_cap, width_based_cap))
+
+        lo, hi = 16, max(18, hi_cap)
         best = None
-        for _ in range(12):  # binary search
+
+        for _ in range(14):  # binary search
             mid = max(lo, min(hi, (lo + hi) // 2))
+            mid = int(mid * global_scale)
             font = font_loader(mid)
-            stroke_w = max(2, int(font.size * 0.07))
-            lines = _wrap_to_width(draw, text, font, max_w, allowed_lines, stroke_w)
+            stroke_w = _stroke_for(font.size)
+
+            lines = _wrap_to_width(draw, text, font, int(max_w * WIDTH_FIT), allowed_lines, stroke_w)
 
             # measure block with stroke
             _, line_h = _measure_line(draw, "Ag", font, stroke_w)
-            step = int(line_h * 1.1)  # 10% line spacing
+            step = int(line_h * 1.08)  # 8% line spacing
             total_h = len(lines) * step
             widest = max((_measure_line(draw, ln, font, stroke_w)[0] for ln in lines), default=0)
 
-            fits = (widest <= max_w) and (total_h <= max_h) and len(lines) > 0
+            fits = (
+                len(lines) > 0 and
+                widest <= int(max_w * WIDTH_FIT) and
+                total_h <= int(max_h * HEIGHT_FIT)
+            )
+
             if fits:
                 best = (font, lines, step)
                 lo = mid + 1
@@ -197,11 +229,11 @@ def _fit_text_block(draw: ImageDraw.ImageDraw, text: str, font_loader,
             return best
 
     # Absolute fallback (tiny but guaranteed)
-    font = font_loader(20)
-    stroke_w = max(2, int(font.size * 0.07))
-    lines = _wrap_to_width(draw, text, font, max_w, 3, stroke_w)
+    font = font_loader(max(16, int(18 * global_scale)))
+    stroke_w = _stroke_for(font.size)
+    lines = _wrap_to_width(draw, text, font, int(max_w * WIDTH_FIT), 3, stroke_w)
     _, line_h = _measure_line(draw, "Ag", font, stroke_w)
-    step = int(line_h * 1.1)
+    step = int(line_h * 1.08)
     return font, lines, step
 
 # ---------- MAIN LAYOUT ----------
@@ -216,14 +248,14 @@ def apply_template(base: Image.Image, headline: str, brand_colors: list[str], lo
     draw = ImageDraw.Draw(overlay)
 
     # Band height by aspect ratio
-    if ar >= 1.4:      # 16:9-ish
-        band_h = int(h * 0.18)
-    elif ar <= 0.8:    # 9:16-ish
-        band_h = int(h * 0.22)
-    else:              # 1:1-ish
-        band_h = int(h * 0.20)
-    band_y = h - band_h
+    if ar >= 1.4:
+        band_h = int(h * 0.12)   # was 0.18
+    elif ar <= 0.8:
+        band_h = int(h * 0.16)   # was 0.22
+    else:
+        band_h = int(h * 0.14)   # was 0.20
 
+    band_y = h - band_h
     # Band color (brand-tinted with alpha)
     band_color = (0, 0, 0, 190)
     if brand_colors:
@@ -235,7 +267,7 @@ def apply_template(base: Image.Image, headline: str, brand_colors: list[str], lo
     band = Image.new("RGBA", (w, band_h), band_color)
     overlay.alpha_composite(band, (0, band_y))
 
-    # Logo first: reserve space on the right (values from your current version)
+    # Logo first: reserve space on the right
     right_margin = int(w * 0.04)
     left_margin  = int(w * 0.06)
     logo_w_reserved = 0
@@ -243,13 +275,13 @@ def apply_template(base: Image.Image, headline: str, brand_colors: list[str], lo
     if logo_path and Path(logo_path).exists():
         try:
             logo_img = Image.open(logo_path).convert("RGBA")
-            # Height target (tune as you like)
+            # Height target
             if ar >= 1.4:        # wide 16:9
-                target_h = int(band_h * 1.10)
+                target_h = int(band_h * 1.20)
             elif ar <= 0.8:      # tall 9:16
-                target_h = int(band_h * 0.80)
+                target_h = int(band_h * 1.20)
             else:                # square
-                target_h = int(band_h * 0.80)
+                target_h = int(band_h * 1.20)
             target_h = min(target_h, band_h - 2)
             scale = target_h / max(1, logo_img.height)
             logo_img = logo_img.resize((int(logo_img.width * scale), target_h), Image.LANCZOS)
@@ -266,7 +298,7 @@ def apply_template(base: Image.Image, headline: str, brand_colors: list[str], lo
     # Fit text (size + wrapping)
     font_loader = lambda sz: get_font(sz)
     font, lines, line_step = _fit_text_block(draw, headline, font_loader, text_max_w, text_max_h, ar)
-    stroke_w = max(2, int(font.size * 0.07))
+    stroke_w = max(1, int(font.size * 0.05))
     pen = (255, 255, 255, 255)
     stroke = (0, 0, 0, 220)
 
